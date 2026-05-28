@@ -1,6 +1,5 @@
 import asyncio
 import os
-import random
 import time
 from pathlib import Path
 
@@ -13,7 +12,7 @@ load_dotenv(Path(__file__).parent / ".env")
 SESSDATA = os.getenv("SESSDATA", "")
 BILI_JCT = os.getenv("BILI_JCT", "")
 MIN_LEVEL = 21
-SWITCH_INTERVAL = 3  # 切换间隔（秒）
+SWITCH_INTERVAL = 5  # 切换间隔（秒）
 CRON_EXPRESSION = "0 * * * *"  # 刷新表达式，默认每整点
 
 API_MY_MEDALS = "https://api.live.bilibili.com/xlive/app-ucenter/v1/user/GetMyMedals"
@@ -31,8 +30,16 @@ async def get_medals(client: httpx.AsyncClient) -> list[dict]:
     all_items = []
     page = 1
     while True:
-        resp = await client.get(API_MY_MEDALS, params={"page": page, "page_size": 10})
-        data = resp.json()
+        for attempt in range(3):
+            try:
+                resp = await client.get(API_MY_MEDALS, params={"page": page, "page_size": 10})
+                data = resp.json()
+                break
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(1)
+                else:
+                    raise RuntimeError(f"获取勋章失败: {e}")
         if data.get("code") != 0:
             raise RuntimeError(f"获取勋章失败: {data}")
         d = data.get("data", {})
@@ -47,12 +54,20 @@ async def get_medals(client: httpx.AsyncClient) -> list[dict]:
 
 async def wear_medal(client: httpx.AsyncClient, medal_id: int) -> bool:
     """佩戴指定勋章。"""
-    resp = await client.post(WEAR_MEDAL_URL, data={"medal_id": medal_id, "csrf": BILI_JCT})
-    data = resp.json()
-    if data["code"] != 0:
-        print(f"  佩戴勋章 {medal_id} 失败: {data.get('message', data)}")
-        return False
-    return True
+    for attempt in range(3):
+        try:
+            resp = await client.post(WEAR_MEDAL_URL, data={"medal_id": medal_id, "csrf": BILI_JCT})
+            data = resp.json()
+            if data["code"] != 0:
+                print(f"  佩戴勋章 {medal_id} 失败: {data.get('message', data)}")
+                return False
+            return True
+        except Exception as e:
+            if attempt < 2:
+                await asyncio.sleep(1)
+            else:
+                print(f"  佩戴勋章 {medal_id} 异常: {e}")
+                return False
 
 
 async def main():
@@ -83,23 +98,38 @@ async def main():
 
         cron = croniter(CRON_EXPRESSION)
         next_refresh = cron.get_next(float)
+        refresh_task = None
+        idx = 0
         print(f"\n每 {SWITCH_INTERVAL} 秒轮换 {len(lit)} 个点亮勋章, cron: {CRON_EXPRESSION}... (Ctrl+C 停止)\n")
 
         while True:
-            # Refresh when cron triggers
-            if time.time() >= next_refresh:
+            # 定时触发后台刷新
+            if time.time() >= next_refresh and refresh_task is None:
                 ts = time.strftime("%H:%M:%S")
-                print(f"[{ts}] 定时刷新勋章列表...")
-                medals = await get_medals(client)
-                lit = [m for m in medals if m.get("level", 0) >= MIN_LEVEL and m.get("is_lighted", 0)]
-                next_refresh = cron.get_next(float)
-                print(f"[{ts}] 刷新完成: {len(lit)} 个点亮勋章, 下次刷新 {time.strftime('%H:%M:%S', time.localtime(next_refresh))}")
-                if not lit:
-                    print("刷新后无点亮勋章，等待中...")
-                    await asyncio.sleep(SWITCH_INTERVAL)
-                    continue
+                print(f"[{ts}] 后台刷新勋章列表...")
 
-            medal = random.choice(lit)
+                async def _refresh():
+                    nonlocal lit, idx
+                    medals = await get_medals(client)
+                    new_lit = [m for m in medals if m.get("level", 0) >= MIN_LEVEL and m.get("is_lighted", 0)]
+                    lit = new_lit
+                    idx = 0
+                    ts2 = time.strftime("%H:%M:%S")
+                    print(f"[{ts2}] 刷新完成: {len(lit)} 个点亮勋章, 下次刷新 {time.strftime('%H:%M:%S', time.localtime(next_refresh))}")
+
+                refresh_task = asyncio.create_task(_refresh())
+                next_refresh = cron.get_next(float)
+
+            # 后台任务完成则清理
+            if refresh_task and refresh_task.done():
+                refresh_task = None
+
+            if not lit:
+                await asyncio.sleep(SWITCH_INTERVAL)
+                continue
+
+            medal = lit[idx % len(lit)]
+            idx += 1
             ok = await wear_medal(client, medal["medal_id"])
             ts = time.strftime("%H:%M:%S")
             status = "OK" if ok else "FAIL"
